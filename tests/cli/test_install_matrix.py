@@ -133,8 +133,8 @@ def _write_curl_shim(
     calls_path = bin_dir / "calls.log"
     if mode == "rate-limit":
         state_path.write_text("1\n", encoding="utf-8")
-    elif mode == "missing":
-        state_path.write_text("missing\n", encoding="utf-8")
+    elif mode in {"missing", "rate-limit-forever", "rate-limit-missing-asset", "server-error"}:
+        state_path.write_text(f"{mode}\n", encoding="utf-8")
     else:
         state_path.write_text("0\n", encoding="utf-8")
     calls_path.write_text("", encoding="utf-8")
@@ -147,7 +147,10 @@ def _write_curl_shim(
             out=""
             url=""
             http1=false
+            head=false
             write_out=false
+            write_fmt=""
+            dump_header=""
             args=("$@")
             i=0
             while [ "$i" -lt "${{#args[@]}}" ]; do
@@ -160,11 +163,17 @@ def _write_curl_shim(
                 -w|--write-out)
                   i=$((i + 1))
                   write_out=true
+                  write_fmt="${{args[$i]}}"
                   ;;
-                -H|--header|--retry|--retry-delay|--connect-timeout|--max-time|-D|--dump-header)
+                -D|--dump-header)
+                  i=$((i + 1))
+                  dump_header="${{args[$i]}}"
+                  ;;
+                -H|--header|--retry|--retry-delay|--connect-timeout|--max-time)
                   i=$((i + 1))
                   ;;
                 --http1.1) http1=true ;;
+                --head|-I) head=true ;;
                 --fail|--silent|--show-error|--location) ;;
                 http://*|https://*) url="$arg" ;;
               esac
@@ -178,13 +187,31 @@ def _write_curl_shim(
             emit() {{
               local code="$1"
               local body="$2"
-              if [ -n "$out" ]; then printf '%s' "$body" >"$out"; fi
+              if [ -n "$dump_header" ]; then
+                printf 'HTTP/1.1 %s\\r\\nRetry-After: 1\\r\\n\\r\\n' "$code" >"$dump_header"
+              fi
+              if [ "$head" = true ]; then
+                if [ "$write_out" = true ]; then printf '%s' "$code"; fi
+                return 0
+              fi
+              if [ -n "$out" ] && [ "$out" != "/dev/null" ]; then printf '%s' "$body" >"$out"; fi
               if [ "$write_out" = true ]; then
-                printf '%s' "$code"
+                case "$write_fmt" in
+                  *url_effective*) printf '%s' "$url" ;;
+                  *) printf '%s' "$code" ;;
+                esac
               elif [ -z "$out" ]; then
                 printf '%s' "$body"
               fi
             }}
+            if printf '%s' "$url" | grep -q '://github.com/.*/releases/latest'; then
+              tag_url="https://github.com/Tracer-Cloud/opensre/releases/tag/v2026.4.29"
+              printf 'latest 302\\n' >> "$calls"
+              if [ "$write_out" = true ]; then
+                printf '%s' "$tag_url"
+              fi
+              exit 0
+            fi
             if printf '%s' "$url" | grep -q 'api.github.com'; then
               if [ "$http1" != false ]; then
                 echo "metadata requests must not force HTTP/1.1" >&2
@@ -194,6 +221,10 @@ def _write_curl_shim(
               code=200
               if [ "$mode" = "missing" ]; then
                 code=404
+              elif [ "$mode" = "rate-limit-forever" ] || [ "$mode" = "rate-limit-missing-asset" ]; then
+                code=403
+              elif [ "$mode" = "server-error" ]; then
+                code=500
               elif [ "$mode" -gt 0 ] 2>/dev/null; then
                 printf '%s\\n' "$((mode - 1))" > "$state"
                 code=403
@@ -202,6 +233,8 @@ def _write_curl_shim(
                 body="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$map" "$url")"
               elif [ "$code" = 403 ]; then
                 body='{{"message":"API rate limit exceeded"}}'
+              elif [ "$code" = 500 ]; then
+                body='{{"message":"Server Error"}}'
               else
                 body='{{"message":"Not Found"}}'
               fi
@@ -210,13 +243,23 @@ def _write_curl_shim(
               exit 0
             fi
             if printf '%s' "$url" | grep -q 'releases/download/'; then
-              if [ "$http1" != true ]; then
+              name="$(basename "$url")"
+              src="$assets/$name"
+              mode="$(tr -d '[:space:]' < "$state")"
+              if [ "$mode" = "rate-limit-missing-asset" ] || [ ! -f "$src" ]; then
+                printf 'asset 404\\n' >> "$calls"
+                emit 404 ""
+                exit 0
+              fi
+              if [ "$head" != true ] && [ "$http1" != true ]; then
                 echo "curl: (92) HTTP/2 stream was not closed cleanly" >&2
                 exit 92
               fi
-              name="$(basename "$url")"
-              src="$assets/$name"
-              [ -f "$src" ] || {{ echo "curl-shim: missing asset $src for $url" >&2; exit 1; }}
+              if [ "$head" = true ]; then
+                printf 'asset 200\\n' >> "$calls"
+                emit 200 ""
+                exit 0
+              fi
               if [ -n "$out" ]; then cp "$src" "$out"; elif [ "$write_out" != true ]; then cat "$src"; fi
               if [ "$write_out" = true ]; then printf '%s' "200"; fi
               printf 'asset 200\\n' >> "$calls"
@@ -586,6 +629,50 @@ def test_install_sh_retries_github_rate_limit_then_installs(tmp_path: Path) -> N
     assert "retrying" not in missing_out
     missing_calls = (tmp_path / "missing" / "shim-bin" / "calls.log").read_text(encoding="utf-8")
     assert missing_calls.splitlines() == ["api 404"]
+
+
+def test_install_sh_falls_back_when_github_api_stays_rate_limited(tmp_path: Path) -> None:
+    """A persistent 403 uses the public release URL instead of failing the install."""
+    result = _run_install_sh(tmp_path, "--main", curl_mode="rate-limit-forever")
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert "rate limit" in result.stderr.lower()
+    assert "github.com instead of api.github.com" in result.stderr
+    assert (tmp_path / "opt" / "bin" / "opensre").is_file()
+    calls = (tmp_path / "shim-bin" / "calls.log").read_text(encoding="utf-8")
+    assert "api 200" not in calls
+    assert calls.splitlines().count("api 403") == 6
+    assert "asset 200" in calls
+
+
+def test_install_sh_rate_limit_fallback_reports_a_missing_asset(tmp_path: Path) -> None:
+    result = _run_install_sh(tmp_path, "--main", curl_mode="rate-limit-missing-asset")
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "does not include asset" in combined
+    assert "Failed to query" not in combined
+
+
+def test_install_sh_does_not_mask_non_rate_limit_metadata_failures(tmp_path: Path) -> None:
+    result = _run_install_sh(tmp_path, "--main", curl_mode="server-error")
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "Failed to query main build metadata from GitHub." in combined
+    assert "instead of api.github.com" not in combined
+
+
+def test_install_sh_latest_release_survives_an_api_rate_limit(tmp_path: Path) -> None:
+    result = _run_install_sh(tmp_path, "--release", curl_mode="rate-limit-forever")
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    installed = tmp_path / "opt" / "bin" / "opensre"
+    version = subprocess.run(
+        [str(installed), "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert "2026.4.29" in version.stdout
 
 
 def test_install_sh_main_channel_end_to_end(tmp_path: Path) -> None:

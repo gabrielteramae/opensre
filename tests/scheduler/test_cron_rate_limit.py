@@ -7,9 +7,17 @@ from pathlib import Path
 import pytest
 
 from config.constants.ci_repair import CI_REPAIR_CRON, CI_REPAIR_REPORT_BUILDER
-from infrastructure.scheduling.scheduler.cron_expression import cap_cron_at_most_hourly
+from infrastructure.scheduling.scheduler.cron_expression import (
+    NO_FUTURE_CRON_MESSAGE,
+    NO_FUTURE_CRON_WARNING,
+    cap_cron_at_most_hourly,
+)
 from infrastructure.scheduling.scheduler.loop_constants import LOOP_PROMPT_PARAM, LOOP_REPORT_PARAM
-from infrastructure.scheduling.scheduler.loops import create_manual_loop
+from infrastructure.scheduling.scheduler.loops import (
+    create_manual_loop,
+    list_loop_summaries,
+    set_loop_enabled,
+)
 from infrastructure.scheduling.scheduler.runner import _register_jobs
 from infrastructure.scheduling.scheduler.storage import task_store as scheduler_store
 from infrastructure.scheduling.scheduler.storage.task_store import add_task, get_task
@@ -24,10 +32,11 @@ from tests.scheduler._bundle import real_runners
         ("0,15,30,45 * * * *", "0 * * * *"),
         ("4,19,34,49 * * * *", "4 * * * *"),
         ("12,27,42,57 * * * *", "12 * * * *"),
-        ("*/15 * * * *", "15 * * * *"),
+        ("*/15 * * * *", "0 * * * *"),
         ("* * * * *", "0 * * * *"),
         ("*/30 * * * * *", "0 * * * *"),
         ("0,30 9 * * 1", "0 9 * * 1"),
+        ("20-40/15 * * * *", "20 * * * *"),
     ],
 )
 def test_schedules_faster_than_hourly_collapse_to_one_minute(cron: str, expected: str) -> None:
@@ -118,3 +127,78 @@ def test_register_persists_the_hourly_cap_and_leaves_ci_repair(
     stored_repair = get_task("repair")
     assert stored_loop is not None and stored_loop.cron == "8 * * * *"
     assert stored_repair is not None and stored_repair.cron == CI_REPAIR_CRON
+
+
+def test_create_manual_loop_rejects_a_cron_that_can_never_fire(tmp_path: Path) -> None:
+    store_path = tmp_path / "scheduler_tasks.json"
+
+    with pytest.raises(ValueError, match=NO_FUTURE_CRON_MESSAGE):
+        create_manual_loop(
+            name="NeverFire",
+            prompt="Impossible date audit",
+            cron="0 8 31 2 *",
+            channels=["interactive_shell"],
+            store_path=store_path,
+        )
+
+    assert list_loop_summaries(store_path=store_path) == []
+
+
+def test_existing_impossible_loop_is_warned_and_not_counted_as_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _Scheduler:
+        def __init__(self) -> None:
+            self.job_ids: list[str] = []
+
+        def add_job(self, *_args: object, **kwargs: object) -> None:
+            self.job_ids.append(str(kwargs["id"]))
+
+    store_path = tmp_path / "tasks.json"
+    monkeypatch.setattr(scheduler_store, "default_task_store_path", lambda: store_path)
+    add_task(
+        ScheduledTask(
+            id="never-fire",
+            name="NeverFire",
+            kind=TaskKind.MANUAL_LOOP,
+            cron="0 8 31 2 *",
+            timezone="UTC",
+            provider=Provider.INTERACTIVE_SHELL,
+            enabled=True,
+            params={LOOP_PROMPT_PARAM: "Impossible date audit"},
+        ),
+        store_path,
+    )
+    add_task(
+        ScheduledTask(
+            id="morning",
+            name="Morning",
+            kind=TaskKind.MANUAL_LOOP,
+            cron="0 8 * * *",
+            timezone="UTC",
+            provider=Provider.INTERACTIVE_SHELL,
+            enabled=True,
+            params={LOOP_PROMPT_PARAM: "Morning audit"},
+        ),
+        store_path,
+    )
+
+    summaries = {loop.id: loop for loop in list_loop_summaries(store_path=store_path)}
+    assert summaries["never-fire"].next_run is None
+    assert NO_FUTURE_CRON_WARNING in summaries["never-fire"].schedule_error
+    assert summaries["morning"].schedule_error == ""
+    assert summaries["morning"].next_run
+
+    scheduler = _Scheduler()
+    assert _register_jobs(scheduler, real_runners()) == 1
+    assert scheduler.job_ids == ["morning"]
+
+    stopped, stop_error = set_loop_enabled("never-fire", enabled=False, store_path=store_path)
+    assert stop_error == ""
+    assert stopped is not None and stopped.summary.enabled is False
+
+    restarted, start_error = set_loop_enabled("never-fire", enabled=True, store_path=store_path)
+    assert restarted is None
+    assert start_error == NO_FUTURE_CRON_MESSAGE
+    stored = get_task("never-fire")
+    assert stored is not None and stored.enabled is False

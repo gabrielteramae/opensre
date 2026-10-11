@@ -150,10 +150,45 @@ def _fires_more_than_hourly(cron: str, timezone: str | None) -> bool:
     return False
 
 
+_FIELD_ITEM = re.compile(
+    r"^(?:(?P<star>\*)|(?P<start>\d+)(?:-(?P<end>\d+))?)(?:/(?P<step>\d+))?$"
+)
+
+
+def _field_values(field: str, maximum: int) -> list[int]:
+    """Numeric values a crontab field can match, read the same way as crontab.
+
+    ``*`` and ``*/step`` start at 0. ``N/step`` runs from ``N`` through
+    ``maximum``. A bare number or an explicit range does not invent values
+    from the step operand.
+    """
+    values: set[int] = set()
+    for item in field.split(","):
+        match = _FIELD_ITEM.fullmatch(item)
+        if match is None:
+            continue
+        step = int(match["step"] or 1)
+        if step < 1:
+            continue
+        if match["star"]:
+            start, end = 0, maximum
+        else:
+            start = int(match["start"])
+            if match["end"] is not None:
+                end = int(match["end"])
+            elif match["step"] is not None:
+                end = maximum
+            else:
+                end = start
+        if start > end or start > maximum:
+            continue
+        values.update(range(start, min(end, maximum) + 1, step))
+    return sorted(values)
+
+
 def _earliest_field_value(field: str, maximum: int) -> str:
-    numbers = [int(match) for match in re.findall(r"\d+", field)]
-    allowed = [number for number in numbers if number <= maximum]
-    return str(min(allowed)) if allowed else "0"
+    values = _field_values(field, maximum)
+    return str(values[0]) if values else "0"
 
 
 def cap_cron_at_most_hourly(cron: str, timezone: str | None = None) -> str:
@@ -179,12 +214,42 @@ def cap_cron_at_most_hourly(cron: str, timezone: str | None = None) -> str:
     return capped
 
 
+NO_FUTURE_CRON_MESSAGE = (
+    "Cannot create loop: this cron schedule has no possible future execution time."
+)
+NO_FUTURE_CRON_WARNING = "this cron schedule has no possible future execution time"
+
+
+def schedule_never_fires(cron: str, timezone: str | None, *, now: datetime | None = None) -> bool:
+    """Whether a syntactically valid cron expression can never fire.
+
+    February 31 is a valid crontab line and still has no execution time.
+    An invalid expression raises ``ValueError`` from :func:`build_cron_trigger`
+    instead of being reported as unreachable.
+    """
+    trigger = build_cron_trigger(cron, timezone)
+    base = now or datetime.now(UTC)
+    if base.tzinfo is None:
+        base = base.replace(tzinfo=UTC)
+    return trigger.get_next_fire_time(None, base) is None
+
+
+def require_future_cron(cron: str, timezone: str | None, *, now: datetime | None = None) -> None:
+    """Reject a schedule that cannot run before it is stored or enabled."""
+    if schedule_never_fires(cron, timezone, now=now):
+        raise ValueError(NO_FUTURE_CRON_MESSAGE)
+
+
 __all__ = [
     "CRON_FIELD_COUNT",
     "CRON_FIELD_COUNT_ERROR",
     "CRON_FIELD_COUNT_WITH_SECONDS",
     "CRON_FORMAT_HELP",
+    "NO_FUTURE_CRON_MESSAGE",
+    "NO_FUTURE_CRON_WARNING",
     "build_cron_trigger",
     "cap_cron_at_most_hourly",
     "day_of_week_names",
+    "require_future_cron",
+    "schedule_never_fires",
 ]

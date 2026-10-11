@@ -20,7 +20,13 @@ from infrastructure.scheduling.scheduler.credentials import (
     resolve_telegram_credentials,
     resolve_telegram_default_chat_id,
 )
-from infrastructure.scheduling.scheduler.cron_expression import cap_cron_at_most_hourly
+from infrastructure.scheduling.scheduler.cron_expression import (
+    NO_FUTURE_CRON_MESSAGE,
+    NO_FUTURE_CRON_WARNING,
+    cap_cron_at_most_hourly,
+    require_future_cron,
+    schedule_never_fires,
+)
 from infrastructure.scheduling.scheduler.loop_constants import (
     LOOP_CHANNELS_PARAM,
     LOOP_CREATED_BY_PARAM,
@@ -358,6 +364,7 @@ def create_manual_loop(
         cron_expr = cron_for_time(time_text, weekdays=weekdays)
     if report.strip() != CI_REPAIR_REPORT_BUILDER:
         cron_expr = cap_cron_at_most_hourly(cron_expr, timezone.strip() or "UTC")
+    require_future_cron(cron_expr, timezone.strip() or "UTC")
 
     channel_providers = normalize_loop_channels(
         channels,
@@ -510,6 +517,8 @@ def set_loop_enabled(
         task.enabled = enabled
         if enabled:
             try:
+                if schedule_never_fires(task.cron, task.timezone, now=now):
+                    return None, NO_FUTURE_CRON_MESSAGE
                 task.next_run = compute_next_run(task, now)
             except ValueError as exc:
                 return None, str(exc)
@@ -660,6 +669,8 @@ def _summarize_group(
         else:
             if computed_next_run:
                 next_runs.append(computed_next_run)
+            elif task.enabled and schedule_never_fires(task.cron, task.timezone, now=now):
+                schedule_errors.append(NO_FUTURE_CRON_WARNING)
 
     channels: list[str] = []
     seen_channels: set[str] = set()
@@ -670,6 +681,7 @@ def _summarize_group(
                 seen_channels.add(provider.value)
 
     last_runs = [task.last_run for task in tasks if task.last_run]
+    unreachable = not next_runs and NO_FUTURE_CRON_WARNING in schedule_errors
     return LoopSummary(
         id=_loop_group_id(representative),
         task_ids=tuple(task.id for task in tasks),
@@ -685,7 +697,7 @@ def _summarize_group(
         enabled=any(task.enabled for task in tasks),
         window_hours=representative.window_hours,
         last_run=max(last_runs) if last_runs else None,
-        next_run=min(next_runs) if next_runs else representative.next_run,
+        next_run=min(next_runs) if next_runs else (None if unreachable else representative.next_run),
         schedule_error="; ".join(schedule_errors),
         mode=representative.params.get(LOOP_MODE_PARAM, "").strip() or LOOP_MODE_REPORT,
     )

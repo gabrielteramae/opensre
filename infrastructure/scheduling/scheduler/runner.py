@@ -27,6 +27,7 @@ from config.constants.work_items import WORK_ITEM_REMINDER_RUN_AT_PARAM
 from infrastructure.scheduling.scheduler.cron_expression import (
     build_cron_trigger,
     cap_cron_at_most_hourly,
+    schedule_never_fires,
 )
 from infrastructure.scheduling.scheduler.executor import execute_task
 from infrastructure.scheduling.scheduler.loop_constants import LOOP_REPORT_PARAM
@@ -96,6 +97,20 @@ def _make_trigger(task: ScheduledTask) -> Any:
         return build_cron_trigger(task.cron, task.timezone)
     except ValueError as exc:
         raise ValueError(f"Invalid cron/timezone for task {task.id}: {exc}") from exc
+
+
+def _cron_never_fires(task: ScheduledTask) -> bool:
+    """True only for a cron task whose expression can never run.
+
+    Work-item reminders use a date trigger, and an invalid cron is reported
+    separately. Neither is treated as an unreachable schedule here.
+    """
+    if task.kind is TaskKind.WORK_ITEM_REMINDER:
+        return False
+    try:
+        return schedule_never_fires(task.cron, task.timezone)
+    except ValueError:
+        return False
 
 
 def _next_run_from_trigger(trigger: Any, now: datetime | None = None) -> str | None:
@@ -433,6 +448,12 @@ def _register_jobs(
             job_kwargs["next_run_time"] = immediate
         else:
             next_run = _next_run_from_trigger(trigger)
+            if next_run is None and _cron_never_fires(task):
+                logger.warning(
+                    "Skipping task %s: this cron schedule has no possible future execution time",
+                    task.id,
+                )
+                continue
             if task.next_run != next_run:
                 task.next_run = next_run
                 update_task(task)
@@ -484,6 +505,8 @@ def _desired_task_ids(*, task_filter: TaskFilter | None = None) -> set[str]:
         if not task.enabled:
             continue
         if task_filter is not None and not task_filter(task):
+            continue
+        if _cron_never_fires(task):
             continue
         desired.add(task.id)
     return desired

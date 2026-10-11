@@ -36,6 +36,29 @@ INSTALL_ORIGIN=""
 MAIN_RELEASE_TAG="${OPENSRE_MAIN_RELEASE_TAG:-main-build}"
 BIN_NAME="opensre"
 requested_version="${OPENSRE_VERSION:-}"
+github_last_status=""
+
+github_status_file() {
+  # Command substitutions run in a subshell, so the status has to outlive them.
+  printf '%s\n' "${TMPDIR:-/tmp}/opensre-install-github-status.$$"
+}
+
+remember_github_status() {
+  github_last_status="$1"
+  printf '%s\n' "$1" > "$(github_status_file)"
+}
+
+read_github_status() {
+  if [ -n "$github_last_status" ]; then
+    printf '%s\n' "$github_last_status"
+    return 0
+  fi
+  local path
+  path="$(github_status_file)"
+  if [ -f "$path" ]; then
+    tr -d '[:space:]' < "$path"
+  fi
+}
 
 [ -n "$INSTALL_DIR" ] && INSTALL_DIR_OVERRIDE=1
 requested_version="${requested_version#v}"
@@ -347,6 +370,7 @@ github_curl() {
 
     case "$http_code" in
       200|201|204)
+        remember_github_status "$http_code"
         if [ -n "$destination" ]; then
           mv "$body_file" "$destination"
         else
@@ -359,6 +383,7 @@ github_curl() {
     esac
 
     if ! github_status_retryable "$http_code" || [ "$attempt" -ge "$max_attempts" ]; then
+      remember_github_status "${http_code:-000}"
       if [ -n "$http_code" ] && [ "$http_code" != "000" ]; then
         printf 'curl: (22) The requested URL returned error: %s\n' "$http_code" >&2
       else
@@ -1080,28 +1105,126 @@ resolve_release_metadata() {
   version="$requested_version"
   release_tag=""
 
-  release_json="$(fetch_release_json "$version")" || {
-    if [ "$INSTALL_CHANNEL" = "main" ]; then
-      die "Failed to query main build metadata from GitHub."
+  if release_json="$(fetch_release_json "$version")"; then
+    apply_release_identity
+    return
+  fi
+
+  if github_rate_limited; then
+    warn "GitHub API rate limit reached (HTTP $(read_github_status)). Resolving the release from github.com instead of api.github.com."
+    if ! release_json="$(release_json_without_api)"; then
+      die "GitHub API rate limit reached (HTTP $(read_github_status)) and the public release URL could not be resolved. Wait and retry, or install from a network that is not sharing GitHub's anonymous API limit."
     fi
+    apply_release_identity
+    return
+  fi
 
-    die "Failed to query release metadata from GitHub."
-  }
+  if [ "$INSTALL_CHANNEL" = "main" ]; then
+    die "Failed to query main build metadata from GitHub."
+  fi
 
+  die "Failed to query release metadata from GitHub."
+}
+
+github_rate_limited() {
+  local status
+  status="$(read_github_status)"
+  case "$status" in
+    403|429)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+apply_release_identity() {
   if [ "$INSTALL_CHANNEL" = "main" ]; then
     release_tag="$(extract_tag_name "$release_json")"
-  else
-    if [ -z "$version" ]; then
-      version="$(extract_tag_name "$release_json")"
-    fi
-    release_tag="v${version}"
+    [ -n "$release_tag" ] || die "Failed to determine the main build tag."
+    return
   fi
 
-  if [ "$INSTALL_CHANNEL" = "main" ]; then
-    [ -n "$release_tag" ] || die "Failed to determine the main build tag."
-  else
-    [ -n "$version" ] || die "Failed to determine the release version."
+  if [ -z "$version" ]; then
+    version="$(extract_tag_name "$release_json")"
   fi
+  [ -n "$version" ] || die "Failed to determine the release version."
+  release_tag="v${version}"
+}
+
+public_url_exists() {
+  local url="$1"
+  local code
+
+  code="$(
+    curl --silent --location --head --output /dev/null \
+      --connect-timeout 20 --max-time 60 \
+      --write-out '%{http_code}' \
+      "$url" || true
+  )"
+  code="${code//[[:space:]]/}"
+  [ "$code" = "200" ]
+}
+
+resolve_latest_release_tag() {
+  local effective tag
+
+  effective="$(
+    curl --silent --location --output /dev/null \
+      --connect-timeout 20 --max-time 60 \
+      --write-out '%{url_effective}' \
+      "https://github.com/${REPO}/releases/latest" || true
+  )"
+  effective="${effective%%\?*}"
+  tag="${effective##*/}"
+  case "$tag" in
+    v*)
+      printf '%s\n' "$tag"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+append_existing_asset() {
+  local name="$1"
+  local url="https://github.com/${REPO}/releases/download/${release_tag}/${name}"
+
+  if ! public_url_exists "$url"; then
+    return 0
+  fi
+  if [ -n "$asset_body" ]; then
+    asset_body="${asset_body},"
+  fi
+  asset_body="${asset_body}{\"name\":\"${name}\"}"
+}
+
+release_json_without_api() {
+  local tag_name archive fallback_archive
+
+  asset_body=""
+  if [ "$INSTALL_CHANNEL" = "main" ]; then
+    release_tag="$MAIN_RELEASE_TAG"
+    tag_name="$MAIN_RELEASE_TAG"
+  elif [ -n "$version" ]; then
+    release_tag="v${version}"
+    tag_name="$release_tag"
+  else
+    release_tag="$(resolve_latest_release_tag)" || return 1
+    version="${release_tag#v}"
+    tag_name="$release_tag"
+  fi
+
+  archive="$(build_archive_name "$version" "$target_arch")"
+  append_existing_asset "$archive"
+  append_existing_asset "${archive}.sha256"
+  if [ "$platform" = "windows" ] && [ "$target_arch" = "arm64" ]; then
+    fallback_archive="$(build_archive_name "$version" "x64")"
+    append_existing_asset "$fallback_archive"
+    append_existing_asset "${fallback_archive}.sha256"
+  fi
+
+  printf '{"tag_name":"%s","assets":[%s]}\n' "$tag_name" "$asset_body"
 }
 
 select_archive_asset() {
